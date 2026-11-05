@@ -12,6 +12,6 @@
 #include <stdint.h>
 
 void pwm_init();
-void pwm_set_duty_us(uint32_t duty_us);
+void servo_set_duty_us(uint32_t duty_us);
 
 #endif /* PWM_H_ */
