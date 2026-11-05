@@ -48,8 +48,6 @@ uint64_t ticksPerMs(void);
 #define time_fmtStr "Time(%uh, %um, %us, %ums, %ut)"
 #define time_fmtParam(t) t.hours, t.minutes, t.seconds, t.msecs, t.ticks
 
-// Interface to pass signed joystick input [-85..+85] to SysTick PID loop
-void time_set_joystick_input(int8_t joystick_val);
-
-// Get current setpoint target (useful for debug printing in main)
-int32_t time_get_target_position(void);
+// Call after SystemInit(); 1 ms SysTick, every 50 ms signals main to run PID.
+void time_init(void);
+bool time_take_control_tick(void);

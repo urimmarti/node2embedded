@@ -13,8 +13,8 @@
 
 
 void pwm_init(void) {
-	PMC->PMC_PCER1 = (1u << (ID_PWM - 32));   // PWM clock
-	PMC->PMC_PCER0 = (1u << ID_PIOB);         // PIOC clock
+	PMC->PMC_PCER1 |= (1u << (ID_PWM - 32));   // PWM clock
+	PMC->PMC_PCER0 |= (1u << ID_PIOB);         // PIOC clock
 
 	PIOB->PIO_ABSR |= (1u << 13);             // peripheral B
 	PIOB->PIO_PDR   = (1u << 13);             // hand pin to peripheral

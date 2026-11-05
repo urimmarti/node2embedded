@@ -1,8 +1,6 @@
-/*
- * node2.c
- * Author : quetzall
- */ 
-
+/* Node 2: CAN/servo/IR foreground work and a single 50 ms PID controller.
+ * SysTick only schedules updates; no floating point or motor operations in ISR.
+ */
 #include "sam.h"
 #include "time.h"
 #include <stdint.h>
@@ -11,207 +9,128 @@
 #include <stdio.h>
 #include "uart.h"
 #include "can.h"
-#include "joystick.h"
 #include "PWM.h"
 #include "ir.h"
 #include "encoder.h"
 #include "motor.h"
 #include "position_controller.h"
 
-#define F_CPU 84000000
-#define PIN_RELAY_MASK (1 << 12) // PC12 (Pin D51)
-#define TOTAL_ENCODER_RANGE 5600
-#define JOYSTICK_MAX        85
+#define F_CPU                 84000000u
+#define PIN_RELAY_MASK        (1u << 12) // PC12
+#define TOTAL_ENCODER_RANGE  5600
+#define JOYSTICK_CENTER      164
+#define JOYSTICK_MAX         85
+#define CONTROL_PERIOD_MS    50u
+#define SWEEP_TIME_MS        1000u
+#define CAN_TIMEOUT_MS       250u
+#define SOLENOID_PULSE_MS    100u
 
-void solenoid_init(void) {
-    PMC->PMC_PCER1 |= (1 << (ID_PIOC - 32));
+// Configure the PID here; it has exactly one owner (main), not a second ISR copy.
+#define PID_KP 0.08f
+#define PID_KI 0.01f
+#define PID_KD 0.005f
+#define PID_MIN_OUTPUT (-50.0f)
+#define PID_MAX_OUTPUT 50.0f
+
+static void solenoid_init(void) {
+    PMC->PMC_PCER1 |= (1u << (ID_PIOC - 32));
     PIOC->PIO_PER = PIN_RELAY_MASK;
     PIOC->PIO_OER = PIN_RELAY_MASK;
+    PIOC->PIO_CODR = PIN_RELAY_MASK;
     PIOC->PIO_PUDR = PIN_RELAY_MASK;
 }
 
-void solenoid_trigger(void) {
-    PIOC->PIO_SODR = PIN_RELAY_MASK;
-    time_spinFor(msecs(100));
-    PIOC->PIO_CODR = PIN_RELAY_MASK;
+static int8_t decode_joystick(uint8_t raw) {
+    int diff = (int)raw - JOYSTICK_CENTER;
+    if (abs(diff) <= 3) return 0;
+    if (diff > JOYSTICK_MAX) diff = JOYSTICK_MAX;
+    if (diff < -JOYSTICK_MAX) diff = -JOYSTICK_MAX;
+    return (int8_t)diff;
 }
 
-int32_t get_joystick_increment(int8_t joystick_val, uint32_t sweep_time_ms, uint32_t dt_ms) {
-    const int32_t DEADZONE = 2;
-
-    if (sweep_time_ms == 0 || dt_ms == 0) {
-        return 0;
-    }
-
-    // Clamp input limits
-    if (joystick_val > JOYSTICK_MAX)  joystick_val = JOYSTICK_MAX;
-    if (joystick_val < -JOYSTICK_MAX) joystick_val = -JOYSTICK_MAX;
-
-    // Deadzone check
-    if (abs(joystick_val) <= DEADZONE) {
-        return 0;
-    }
-
-    int32_t effective_joy;
-    int32_t max_joy_range = JOYSTICK_MAX - DEADZONE;
-
-    if (joystick_val > 0) {
-        effective_joy = (int32_t)joystick_val - DEADZONE;
-    } else {
-        effective_joy = (int32_t)joystick_val + DEADZONE;
-    }
-
-    // Multiply before dividing to prevent rounding to 0
-    int32_t numerator   = effective_joy * TOTAL_ENCODER_RANGE * (int32_t)dt_ms;
-    int32_t denominator = max_joy_range * (int32_t)sweep_time_ms;
-
-    return numerator / denominator;
+// Integrate the commanded velocity over a 50 ms sample (5600 ticks per full sweep).
+static int32_t joystick_increment(int8_t input) {
+    const int deadzone = 2;
+    if (abs((int)input) <= deadzone) return 0;
+    const int signed_magnitude = (input > 0) ? input - deadzone : input + deadzone;
+    return (int32_t)signed_magnitude * TOTAL_ENCODER_RANGE * CONTROL_PERIOD_MS /
+           ((JOYSTICK_MAX - deadzone) * SWEEP_TIME_MS);
 }
 
 int main(void) {
     SystemInit();
-    
-    WDT->WDT_MR = WDT_MR_WDDIS; // Desactivar watchdog
+    WDT->WDT_MR = WDT_MR_WDDIS;
+    time_init();
+    uart_init(F_CPU, 9600);
+    printf("Node 2 ready\r\n");
 
-    uart_init(84000000, 9600);
-    printf("Node 2 listo\r\n");
-    
-    can_init((CanInit){.brp = F_CPU/2000000-1, .phase1 = 5, .phase2 = 1, .propag = 6}, 0);
-      
+    // 125 kbit/s: 84 MHz / (42 * 16 TQ). Match Node 1's MCP2515 at 16 MHz.
+    can_init((CanInit){.brp = F_CPU / 2000000u - 1u,
+                       .phase1 = 5, .phase2 = 1, .propag = 6}, 0);
     encoder_init();
-	ir_init();
+    ir_init();
     solenoid_init();
     pwm_init();
     motor_init();
+    motor_stop();
 
-    // 2. PID Controller Initialization
     PIDController pos_pid;
-    // Kp = 0.08, Ki = 0.01, Kd = 0.005, output limits [-50, 50]
-    pid_init(&pos_pid, 0.08f, 0.01f, 0.005f, -50.0f, 50.0f);
-
-    // Persistent Control Variables
-    int8_t   joystick_pos = 0;       // Dynamic signed joystick offset [-85..+85]
-    int32_t  target_position = 0;    // Dynamic accumulated setpoint [0..5600]
-    uint64_t last_pid_time = time_now();
-    CanMsg   rx_msg;
-
-    const uint32_t SWEEP_TIME_MS = 1000; // 1 second full range
-    const uint32_t DT_MS         = 50;   // 50 ms sample rate
-	uint8_t joystick_x;
-
-	while (1) {
-		// -------------------------------------------------------------
-		// CAN Message Processing
-		// -------------------------------------------------------------
-		if (can_rx(&rx_msg)) {
-			if (rx_msg.id == 0) {
-				// Update joystick raw reading & map center 164 -> signed [-85..+85]
-				uint8_t raw_x = rx_msg.byte[0];
-				int diff = (int)raw_x - 164;
-				int8_t joy_pos = 0;
-
-				if (abs(diff) > 3) {
-					if (diff > 85)  diff = 85;
-					if (diff < -85) diff = -85;
-					joy_pos = (int8_t)diff;
-				}
-
-				// Pass updated joystick state directly to background SysTick PID loop
-				time_set_joystick_input(joy_pos);
-
-				// Update Servo Position: Map [67..255] -> [900..2100] us
-				uint8_t joystick_y = rx_msg.byte[1];
-				uint32_t servo_us = (uint32_t)((int32_t)joystick_y - 67) * (2100 - 900) / (250 - 68) + 900;
-				servo_set_duty_us(servo_us);
-
-				// Update Solenoid Output
-				uint8_t button_state = rx_msg.byte[2];
-				if (button_state < 10) {
-					solenoid_trigger();
-				}
-			}
-		}
-
-		if (ir_check_goal()) {
-			uint8_t current_score = ir_get_score();
-			printf("¡GOL! Puntuacion actual: %d\r\n", current_score);
-		}
-	}
-
+    pid_init(&pos_pid, PID_KP, PID_KI, PID_KD, PID_MIN_OUTPUT, PID_MAX_OUTPUT);
+    int32_t target_position = encoder_read(); // Avoid a startup jump to zero.
+    if (target_position < 0) target_position = 0;
+    if (target_position > TOTAL_ENCODER_RANGE) target_position = TOTAL_ENCODER_RANGE;
+    int8_t joystick_pos = 0;
+    uint64_t last_can_time = time_now();
+    uint64_t solenoid_off_time = 0;
+    bool button_was_pressed = false;
+    bool solenoid_active = false;
+    CanMsg rx_msg;
 
     while (1) {
-        // -------------------------------------------------------------
-        // Task A: Process Incoming CAN Messages (Runs as fast as possible)
-        // -------------------------------------------------------------
-        if (can_rx(&rx_msg)) {
-            if (rx_msg.id == 0) {
-                // Update joystick raw reading & map center 164 -> signed [-85..+85]
-                joystick_x = rx_msg.byte[0];
-                int diff = (int)joystick_x - 164;
-                if (abs(diff) <= 3) {
-                    joystick_pos = 0;
-                } else {
-                    if (diff > JOYSTICK_MAX)  diff = JOYSTICK_MAX;
-                    if (diff < -JOYSTICK_MAX) diff = -JOYSTICK_MAX;
-                    joystick_pos = (int8_t)diff;
-                }
+        // CAN is polled; no CAN interrupt necessary. Never block the control loop.
+        if (can_rx(&rx_msg) && rx_msg.id == 0 && rx_msg.length >= 3) {
+            joystick_pos = decode_joystick(rx_msg.byte[0]);
+            last_can_time = time_now();
 
-                // Update Servo Position: Map [67..255] -> [900..2100] us
-                uint8_t joystick_y = rx_msg.byte[1];
-                uint32_t servo_us = (uint32_t)((int32_t)joystick_y - 67) * (2100 - 900) / (250 - 68) + 900;
-                servo_set_duty_us(servo_us);
+            // Map input to servo pulse, with saturation before unsigned arithmetic.
+            int32_t servo_us = 900 + ((int32_t)rx_msg.byte[1] - 67) * 1200 / 182;
+            if (servo_us < 900) servo_us = 900;
+            if (servo_us > 2100) servo_us = 2100;
+            servo_set_duty_us((uint32_t)servo_us);
 
-                // Update Solenoid Output
-                uint8_t button_state = rx_msg.byte[2];
-                if (button_state < 10) {
-                    solenoid_trigger();
-                }
+            bool pressed = rx_msg.byte[2] < 10;
+            if (pressed && !button_was_pressed && !solenoid_active) {
+                PIOC->PIO_SODR = PIN_RELAY_MASK;
+                solenoid_off_time = time_now() + msecs(SOLENOID_PULSE_MS);
+                solenoid_active = true;
             }
+            button_was_pressed = pressed;
+        }
+
+        uint64_t now = time_now();
+        if (solenoid_active && now >= solenoid_off_time) {
+            PIOC->PIO_CODR = PIN_RELAY_MASK;
+            solenoid_active = false;
+        }
+        // Lost CAN must not leave a stale commanded velocity active indefinitely.
+        if (now - last_can_time >= msecs(CAN_TIMEOUT_MS)) {
+            joystick_pos = 0;
+            button_was_pressed = false;
+        }
+
+        if (time_take_control_tick()) {
+            target_position += joystick_increment(joystick_pos);
+            if (target_position > TOTAL_ENCODER_RANGE) target_position = TOTAL_ENCODER_RANGE;
+            if (target_position < 0) target_position = 0;
+
+            int32_t current_position = encoder_read();
+            int32_t output = pid_compute(&pos_pid, target_position,
+                                         current_position, CONTROL_PERIOD_MS / 1000.0f);
+            motor_set(output);
         }
 
         if (ir_check_goal()) {
-            uint8_t current_score = ir_get_score();
-            printf("¡GOL! Puntuacion actual: %d\r\n", current_score);
-        }
-
-        // -------------------------------------------------------------
-        // Task B: Non-Blocking 50 ms Periodic PID Position Control Loop
-        // -------------------------------------------------------------
-        if ((time_now() - last_pid_time) >= msecs(DT_MS)) {
-            last_pid_time = time_now();
-            const float DT = 0.050f;
-
-            // 1. Calculate step increase from signed joystick position
-            int32_t increase = get_joystick_increment(joystick_pos, SWEEP_TIME_MS, DT_MS);
-
-            // 2. Accumulate position target and clamp [0..5600]
-            target_position += increase;
-            if (target_position > TOTAL_ENCODER_RANGE) target_position = TOTAL_ENCODER_RANGE;
-            if (target_position < 0)                   target_position = 0;
-
-            // 3. Read encoder feedback
-            int32_t current_pos = encoder_read();
-
-            // 4. Compute PID output command using accumulated target_position
-            int32_t motor_speed = pid_compute(&pos_pid, target_position, current_pos, DT);
-
-            // 5. Update motor driver hardware
-            //motor_set(motor_speed);
-
-				  
-				  
-			// 1. Map joystick position [80..250] to target setpoint [0..5600]
-
-			int32_t setpoint = map_joystick_to_setpoint(joystick_x);
-
-
-			current_pos = encoder_read();
-			motor_speed = pid_compute(&pos_pid, setpoint, current_pos, DT);
-			motor_set(motor_speed);
-			          //  printf("motor speed %d | joystick_pos %d | pos_increase %d | desired_pos %d | enc %d\r\n",
-			          //  motor_speed, joystick_pos, increase, target_position, current_pos);
+            printf("Goal! Score: %u\r\n", (unsigned)ir_get_score());
         }
     }
-    
-    return 0;
 }

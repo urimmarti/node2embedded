@@ -6,8 +6,8 @@
 
 void encoder_init(void) {
 	// 1. Habilitar los relojes del puerto PIOC y del bloque TC2 (Canal 6 / TC6)[cite: 4]
-	PMC->PMC_PCER0 = (1u << ID_PIOC);
-	PMC->PMC_PCER1 = (1u << (ID_TC6 - 32));
+	PMC->PMC_PCER0 |= (1u << ID_PIOC);
+	PMC->PMC_PCER1 |= (1u << (ID_TC6 - 32));
 
 	// 2. Configurar AMBOS pines (PC25 y PC26) para que usen la función de Periférico B[cite: 4]
 	// (Esto conecta físicamente las señales A y B del encoder al bloque de hardware del temporizador)[cite: 4]

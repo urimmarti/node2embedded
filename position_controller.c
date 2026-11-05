@@ -64,6 +64,7 @@ int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, f
     // 1. Deadband check
     if (abs(error) <= pid->deadband_ticks) {
         pid->prev_error = error;
+        pid->integral = 0.0f;
         return 0;
     }
 
@@ -74,10 +75,10 @@ int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, f
     pid->integral += (float)error * dt;
     float i_term = pid->ki * pid->integral;
 
-    if (i_term > pid->i_max) {
+    if (pid->ki != 0.0f && i_term > pid->i_max) {
         i_term = pid->i_max;
         pid->integral = pid->i_max / pid->ki;
-    } else if (i_term < -pid->i_max) {
+    } else if (pid->ki != 0.0f && i_term < -pid->i_max) {
         i_term = -pid->i_max;
         pid->integral = -pid->i_max / pid->ki;
     }

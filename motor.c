@@ -25,8 +25,8 @@
 #define MOTOR_MAX_PERCENT 80           // tope de seguridad
 
 void motor_init(void){
-	PMC->PMC_PCER0 = (1u << ID_PIOB) | (1u << ID_PIOC);
-	PMC->PMC_PCER1 = (1u << (ID_PWM - 32));
+	PMC->PMC_PCER0 |= (1u << ID_PIOB) | (1u << ID_PIOC);
+	PMC->PMC_PCER1 |= (1u << (ID_PWM - 32));
 
 	// Pin de PWM -> periferico B
 	MOTOR_PWM_PIO->PIO_ABSR |= MOTOR_PWM_BIT;
