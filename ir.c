@@ -11,7 +11,7 @@
 #include "time.h"
 
 // Ajusta este umbral según lo que veas por la consola al pasar la pelota
-#define IR_THRESHOLD 2000
+#define IR_THRESHOLD 100
 
 static uint8_t score = 0;
 static bool was_blocked = false;
