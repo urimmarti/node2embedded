@@ -3,7 +3,7 @@
  *
  * Created: 05.11.2026 12:42:54
  *  Author: quetzall
- */ 
+ */
 #include "position_controller.h"
 #include <stdlib.h>
 
@@ -11,7 +11,7 @@
 #define SAMPLE_RATE 20
 #define MAX_JOYSTICK_VAL 85
 #define ENCODER_RANGE 5600
-
+#define CAMERA_DEADBAND_TICKS 1
 
 void pid_init(PIDController *pid, float kp, float ki, float kd, float out_min, float out_max) {
     pid->kp = kp;
@@ -54,15 +54,16 @@ int32_t map_joystick_to_setpoint(uint8_t joystick_val) {
 }
 
 /**
- * @brief PID Calculation: Output = Kp*e + Ki*?e dt + Kd*(de/dt)
+ * @brief PID Calculation: Output = Kp*e + Ki*integral(e)dt + Kd*(de/dt)
  */
-int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, float dt) {
+int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, float dt, bool camera_mode) {
     if (dt <= 0.0f) return 0;
 
     int32_t error = setpoint - current_pos;
+    int32_t deadband = camera_mode ? CAMERA_DEADBAND_TICKS : pid->deadband_ticks;
 
     // 1. Deadband check
-    if (abs(error) <= pid->deadband_ticks) {
+    if (abs(error) <= deadband) {
         pid->prev_error = error;
         pid->integral = 0.0f;
         return 0;
@@ -98,21 +99,20 @@ int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, f
     return (int32_t)output;
 }
 
-int map_joystick_to_pos_increase(int joystick_pos){
-	//with the joystick set at max side, in sweep_time ms there must have been a 0-5600 increase
-	int max_pos_increase_per_sample = ENCODER_RANGE / (SWEEP_TIME);
-	// DO A MAPPING: the range 0-85 , must go to the range 0-MAX_INCREASE
-	return joystick_pos *max_pos_increase_per_sample / MAX_JOYSTICK_VAL;
-
-}
-int update_desired_pos(int desired_pos, int increase){
-	desired_pos+=increase;
-	if (desired_pos <1){
-		desired_pos = 1;
-	}
-	if (desired_pos > 5614){
-		desired_pos = 5610;
-	}
-	return desired_pos;
+int map_joystick_to_pos_increase(int joystick_pos) {
+    // With the joystick set at max side, in sweep_time ms there must have been a 0-5600 increase
+    int max_pos_increase_per_sample = ENCODER_RANGE / (SWEEP_TIME);
+    // DO A MAPPING: the range 0-85 must go to the range 0-MAX_INCREASE
+    return joystick_pos * max_pos_increase_per_sample / MAX_JOYSTICK_VAL;
 }
 
+int update_desired_pos(int desired_pos, int increase) {
+    desired_pos += increase;
+    if (desired_pos < 1) {
+        desired_pos = 1;
+    }
+    if (desired_pos > 5614) {
+        desired_pos = 5610;
+    }
+    return desired_pos;
+}

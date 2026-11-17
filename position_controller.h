@@ -31,7 +31,7 @@ typedef struct {
 void    pid_init(PIDController *pid, float kp, float ki, float kd, float out_min, float out_max);
 void    pid_reset(PIDController *pid);
 int32_t map_joystick_to_setpoint(uint8_t joystick_val);
-int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, float dt);
+int32_t pid_compute(PIDController *pid, int32_t setpoint, int32_t current_pos, float dt, bool camera_mode);
 
 
 #endif /* POSITION_CONTROLLER_H_ */
